@@ -1,0 +1,180 @@
+---
+title: "Prediction Assignment Writeup"
+author: "Raffaele Martino"
+date: "December 2, 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Synopsis
+
+This document describes the analysis conducted on the provided data set. A set of 21 predictors has been built by a Principal Components Analysis, after having removed the empty columns. This predictor set has been used to train a Random Forest. The predictor showed an estimated accuracy of more than 95%.
+
+## Data partitioning
+
+The first step of the prediction study is data partitioning, in order to set aside from the very beginning, the data set that will be used only once to validate the out-of-sample model accuracy. However, in order to decide how to best partitioning data, it is necessary to read it first.
+
+```{r, message = FALSE}
+library(caret)
+dataset <- read.csv("./data/pml-training.csv");
+```
+
+Given the size of the data set, we decide to set aside a validation set for the final accuracy estimation, and to use aa test set for model refinement. Therefore we split the original data set as follows: 60% training, 20% validation, 20% testing.
+
+```{r}
+set.seed(291091);
+inValidation <- createDataPartition(dataset$classe, p = .2, list = FALSE);
+validation <- dataset[inValidation, ];
+design_dataset <- dataset[-inValidation, ];
+```
+
+Note that here it is not correct to use `p = .6`, since we are now working with the 80% of the original data. The coorrect proportion of data can be obtained by:
+
+```{r}
+inTrain <- createDataPartition(design_dataset$classe, p = .6/.8, list = FALSE)
+training <- design_dataset[inTrain, ];
+testing <- design_dataset[-inTrain, ];
+```
+
+Now we can work on the training set only for the predictors selection, whereas the test set will come into play in the model evaluation phase.
+
+## Predictors selection
+
+### Cleaning data
+
+We start by taking a look at the training set.
+
+```{r}
+str(training)
+```
+
+We noticed that there are a number of columns full of missing values. Therefore we make the hypothesis that a number of columns are almost empty, and hence can be safely discarded as useless predictors. To verify this hypothesis it is necessary to count the number of missing values, or equivalently the number of valid values, in each column. However, a number of columns are characters, so we cannot use simply `is.na()`. Therefore, we define the following function, for use with `sapply()`, that counts the total number of valid values in each column handling character columns appropriately.
+
+```{r}
+countNotNA <- function(col) {
+	if (class(col) == 'character') {
+		sum(nchar(col)>0);
+	} else {
+		sum(complete.cases(col));
+	};
+}
+
+numNotNA <- sapply(training, countNotNA)
+```
+
+A look at the different counts of valid values yields an interesting insigth:
+
+```{r}
+unique(numNotNA)
+```
+
+This means that columns with incomplete data contain values for a fraction of only `r 254/11772` of the observations. Hence these can be safely discarded.
+
+```{r}
+useColumn <- numNotNA == nrow(training)
+training <- training[, useColumn]
+```
+
+It is useful to save the index of the column containing the class, which is the "classe" column, since this column often needs to be singled out in the model building phase. As a side effect, this operation allows us to confirm that the class column has actually been preserved:
+
+```{r}
+classIdx <- grep("classe", names(training))
+```
+
+Now we check whether all the remaining predictors are numeric:
+
+```{r}
+sapply(training, class)
+```
+
+Some character columns, representing factor variables, have survived. These could be a problem for algorithms such as linear regression, but not for decision trees. Since we ended up with a random forest, no further processing is required for these variables.
+
+### Principal Component Analysis
+
+We are still left with a significant number of predictors:
+
+```{r}
+ncol(training[, -classIdx])
+```
+
+Therefore, we decide to apply Principal Component Analysis to the training set. But first, we apply zero- and near-zero-variance filter, centering and scaling to all the numeric variables. We ask the `preProcess` function to keep at least 90% of the variance
+
+```{r}
+PC9 <- preProcess(training[, -classIdx], method=c("zv", "nzv", "center", "scale", "pca"), thresh = .9)
+trainPC9 <- predict(PC9, training[, -classIdx])
+trainPC9$classe <- training$classe
+PC9
+```
+
+We append the class column because this is useful with some algorithms in `caret`, namely decision trees. We end up with 21 predictors, so we check whether lower values of preserved variance can lead to a dramatic decrease in the number of predictor, and finally yielding better accuracy. We found an interest result with 70% of variance preserved, which requires 10 principal components.
+
+```{r}
+PC7 <- preProcess(training[, -classIdx], method=c("zv", "nzv", "center", "scale", "pca"), thresh = .7)
+trainPC7 <- predict(PC7, training[, -classIdx])
+trainPC7$classe <- training$classe
+PC9
+```
+
+We will evaluate these two sets of predictors against the test set, which needs to be prepared in the same way, and with parameters estimated on, the training set:
+
+```{r}
+testing <- testing[, useColumn]
+testPC9 <- predict(PC9, testing[, -classIdx])
+testPC7 <- predict(PC7, testing[, -classIdx])
+```
+
+## Algorithm selection
+
+The goal is to achieve an accuracy of **80%**. We will evaluate different algorithms until the out-sample accuracy, as estimated on the test set, surpasses this threshold.
+
+### Decision tree
+
+The first attempt is with decision trees. We decide to perform 10-fold cross-validation, repeated 5 times.
+
+```{r cache = TRUE}
+train_control <- trainControl(method = "repeatedcv", number = 10, repeats = 5)
+decisionTreePC9 <- train(classe ~ ., method = 'rpart', trControl = train_control, data = trainPC9)
+confusionMatrix(as.factor(testing$classe), predict(decisionTreePC9, newdata = testPC9))
+```
+
+The resulting accuracy of `r confusionMatrix(as.factor(testing$classe), predict(decisionTreePC9, newdata = testPC9))$overall["Accuracy"]` is quite disappointing. We now wonder whether the 70%-variance predictors set performs better:
+
+```{r cache = TRUE}
+decisionTreePC7 <- train(classe ~ ., method = 'rpart', trControl = train_control, data = trainPC7)
+confusionMatrix(as.factor(testing$classe), predict(decisionTreePC7, newdata = testPC7))
+```
+
+Interestingly, reducing the number of predictors did improve accuracy significantly, up to `r confusionMatrix(as.factor(testing$classe), predict(decisionTreePC7, newdata = testPC7))$overall["Accuracy"]`. However, we are still far from our objective.
+
+### Random forest
+
+Our next attempr is the random forest. Given that the random forest algorithm has already built-in a form of cross-validation (bootstrapping), that we saw no improvement in the case of decision trees, and given the time complexity of the algorithm, we choose **not** to perform cross-validation.
+
+```{r cache = TRUE}
+randomForestPC9 <- train(classe ~ ., method = 'rf', data = trainPC9)
+confusionMatrix(as.factor(testing$classe), predict(randomForestPC9, newdata = testPC9))
+```
+
+The resulting accuracy `r confusionMatrix(as.factor(testing$classe), predict(randomForestPC9, newdata = testPC9))$overall["Accuracy"]` is **far above** the threshold. Given the result obtained with the decision tree, we check also for the random forest whether the 70%-variance predictors set performs better:
+
+```{r cache = TRUE}
+randomForestPC7 <- train(classe ~ ., method = 'rf', data = trainPC7)
+confusionMatrix(as.factor(testing$classe), predict(randomForestPC7, newdata = testPC7))
+```
+
+This time the accuracy `r confusionMatrix(as.factor(testing$classe), predict(randomForestPC7, newdata = testPC7))$overall["Accuracy"]` slightly decreases. Therefore, we take the random forest model with 21 predictors.
+
+## Validation
+
+To get the final value of accuracy, we apply only one time the model on the validation set. Of course, also the validation set needs to be pre-processed the same way as the training set.
+
+```{r}
+validation <- validation[, useColumn]
+validationPC <- predict(PC9, validation[, -classIdx])
+confusionMatrix(as.factor(validation$classe), predict(randomForestPC9, newdata = validationPC))
+```
+
+The result confirms the accuracy estimated on the test set.
